@@ -1,4 +1,8 @@
 #pragma once
+#include <chrono>
+#include <IO/CompressionMethod.h>
+#include <base/defines.h>
+#include <Common/Logger.h>
 #include "config.h"
 
 #if USE_AVRO
@@ -14,6 +18,7 @@
 namespace ProfileEvents
 {
     extern const Event IcebergMetadataFilesCacheMisses;
+    extern const Event IcebergMetadataFilesCacheStaleMisses;
     extern const Event IcebergMetadataFilesCacheHits;
     extern const Event IcebergMetadataFilesCacheWeightLost;
 }
@@ -26,6 +31,25 @@ namespace CurrentMetrics
 
 namespace DB
 {
+
+namespace Iceberg
+{
+struct MetadataFileWithInfo
+{
+    Int32 version;
+    String path;
+    CompressionMethod compression_method;
+};
+}
+
+struct LatestMetadataVersion
+{
+    /// time when it's been received from the remote catalog and cached
+    std::chrono::time_point<std::chrono::system_clock> cached_at;
+    /// the actual metadata version reference
+    Iceberg::MetadataFileWithInfo latest_metadata;
+};
+using LatestMetadataVersionPtr = std::shared_ptr<LatestMetadataVersion>;
 
 /// The structure that can identify a manifest file. We store it in cache.
 /// And we can get `ManifestFileContent` from cache by ManifestFileEntry.
@@ -44,16 +68,22 @@ using ManifestFileCacheKeys = std::vector<ManifestFileCacheKey>;
 /// For simplicity, we keep them in the same cache.
 struct IcebergMetadataFilesCacheCell : private boost::noncopyable
 {
-    /// The cached element could be
-    /// - metadata.json content
-    /// - manifest list consists of cache keys which will retrieve the manifest file from cache
-    /// - manifest file
-    std::variant<String, ManifestFileCacheKeys, Iceberg::ManifestFileCacheableInfo> cached_element;
+    /// The cached entities can be:
+    /// - reference to the latest metadata version (metadata.json path) [table_path --> LatestMetadataVersionPtr]
+    /// - metadata.json content [file_path --> String]
+    /// - manifest list consists of cache keys which will retrieve the manifest file from cache [file_path --> ManifestFileCacheKeys]
+    /// - manifest file [file_path --> Iceberg::ManifestFileCacheableInfo]
+    std::variant<String, LatestMetadataVersionPtr, ManifestFileCacheKeys, Iceberg::ManifestFileCacheableInfo> cached_element;
     Int64 memory_bytes;
 
     explicit IcebergMetadataFilesCacheCell(String && metadata_json_str)
         : cached_element(std::move(metadata_json_str))
         , memory_bytes(std::get<String>(cached_element).capacity() + SIZE_IN_MEMORY_OVERHEAD)
+    {
+    }
+    explicit IcebergMetadataFilesCacheCell(LatestMetadataVersionPtr latest_metadata_version)
+        : cached_element(latest_metadata_version)
+        , memory_bytes(getMemorySizeOfMetadataVersion(latest_metadata_version) + SIZE_IN_MEMORY_OVERHEAD)
     {
     }
     explicit IcebergMetadataFilesCacheCell(ManifestFileCacheKeys && manifest_file_cache_keys_)
@@ -68,6 +98,12 @@ struct IcebergMetadataFilesCacheCell : private boost::noncopyable
     }
 private:
     static constexpr size_t SIZE_IN_MEMORY_OVERHEAD = 200; /// we always underestimate the size of an object;
+
+    static size_t getMemorySizeOfMetadataVersion(const LatestMetadataVersionPtr & metadata_version)
+    {
+        chassert(metadata_version);
+        return sizeof(LatestMetadataVersion) + metadata_version->latest_metadata.path.size();
+    }
 
     static size_t getMemorySizeOfManifestCacheKeys(const ManifestFileCacheKeys & manifest_file_cache_keys)
     {
@@ -147,6 +183,52 @@ public:
             ProfileEvents::increment(ProfileEvents::IcebergMetadataFilesCacheHits);
         return std::get<Iceberg::ManifestFileCacheableInfo>(result.first->cached_element);
     }
+
+    template <typename LoadFunc>
+    LatestMetadataVersionPtr getOrSetLatestMetadataVersion(const String & data_path, LoadFunc && load_fn, time_t tolerated_staleness_ms)
+    {
+        /// tolerated_staleness_ms=0 would mean that a non-cached value is required
+        if (tolerated_staleness_ms > 0)
+        {
+            auto found = Base::get(data_path);
+            if (found)
+            {
+                LatestMetadataVersionPtr cell = std::get<LatestMetadataVersionPtr>(found->cached_element);
+                if (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - cell->cached_at).count() <= tolerated_staleness_ms)
+                {
+                    /// the cached element is found and it's not stale accurding to our expectation
+                    ProfileEvents::increment(ProfileEvents::IcebergMetadataFilesCacheHits);
+                    return cell;
+                }
+                else
+                {
+                    ProfileEvents::increment(ProfileEvents::IcebergMetadataFilesCacheStaleMisses);
+                }
+            }
+            else
+            {
+                ProfileEvents::increment(ProfileEvents::IcebergMetadataFilesCacheMisses);
+            }
+        }
+
+        /// it's either a) nothing found in cache, or b) it's too old (stale), or c) the latest data has been requested - in all cases, we'll load it and cache it
+        /// TODO: we force loading here and not passing the function to inside cache as it would work normally, because
+        ///       we'll be accessing the same cache during the loading (specific to this scenario) and that'd cause self-lock
+        ///       First, #97410 CacheBase needs to be refactored to support generic entity-based quotation
+        ///       Second, we should use two separate caches (can be encapsulated under the same umbrella), 1st keeps logical snapshots (latest version), 2nd files
+        ///               and in this case, we could safely access the 2nd cache while loading the element for the 1st one.
+        LatestMetadataVersionPtr cell = std::make_shared<LatestMetadataVersion>();
+        cell->latest_metadata = load_fn();
+        cell->cached_at = std::chrono::system_clock::now();
+
+        /// TODO: Again, with #97410 by getting a generic caching for TTL & Staleness, we'll be able to force set on a stale key
+        /// NOTE: if several threads will concurrently enter this method, and will concurrently load data - this will result in some extra work, which is fine-ish
+        ///       but at least it won't lead to race - the last thread will overwrite the cached value, and this is okay
+        Base::set(data_path, std::make_shared<IcebergMetadataFilesCacheCell>(cell));
+
+        return cell;
+    }
+
 
 private:
     /// Called for each individual entry being evicted from cache

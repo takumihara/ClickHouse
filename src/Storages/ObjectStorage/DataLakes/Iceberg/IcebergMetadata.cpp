@@ -1,3 +1,5 @@
+#include <base/defines.h>
+#include <base/sleep.h>
 #include "config.h"
 #if USE_AVRO
 
@@ -33,6 +35,7 @@
 #include <Databases/DataLake/Common.h>
 #include <Disks/DiskType.h>
 #include <Core/ColumnsWithTypeAndName.h>
+#include <Core/ServerSettings.h>
 #include <Core/Settings.h>
 #include <Core/NamesAndTypes.h>
 #include <Databases/DataLake/ICatalog.h>
@@ -89,6 +92,7 @@ namespace DataLakeStorageSetting
 {
 extern const DataLakeStorageSettingsString iceberg_metadata_file_path;
 extern const DataLakeStorageSettingsString iceberg_metadata_table_uuid;
+extern const DataLakeStorageSettingsUInt32 iceberg_metadata_async_refresh_period_ms;
 extern const DataLakeStorageSettingsBool iceberg_recent_metadata_file_by_last_updated_ms_field;
 extern const DataLakeStorageSettingsBool iceberg_use_version_hint;
 extern const DataLakeStorageSettingsNonZeroUInt64 iceberg_format_version;
@@ -151,7 +155,7 @@ Iceberg::PersistentTableComponents IcebergMetadata::initializePersistentTableCom
     StorageObjectStorageConfigurationPtr configuration, IcebergMetadataFilesCachePtr cache_ptr, ContextPtr context_)
 {
     const auto [metadata_version, metadata_file_path, compression_method]
-        = getLatestOrExplicitMetadataFileAndVersion(object_storage, configuration->getPathForRead().path, configuration->getDataLakeSettings(), cache_ptr, context_, log.get(), std::nullopt);
+        = getLatestOrExplicitMetadataFileAndVersion(object_storage, configuration->getPathForRead().path, configuration->getDataLakeSettings(), cache_ptr, context_, log.get(), std::nullopt, true);
     LOG_DEBUG(log, "Latest metadata file path is {}, version {}", metadata_file_path, metadata_version);
     auto metadata_object
         = getMetadataJSONObject(metadata_file_path, object_storage, cache_ptr, context_, log, compression_method, std::nullopt);
@@ -184,7 +188,7 @@ Iceberg::PersistentTableComponents IcebergMetadata::initializePersistentTableCom
     };
 }
 
-std::pair<IcebergDataSnapshotPtr, TableStateSnapshot> IcebergMetadata::getRelevantState(const ContextPtr & context) const
+std::pair<IcebergDataSnapshotPtr, TableStateSnapshot> IcebergMetadata::getRelevantState(const ContextPtr & context, bool force_fetch_latest_metadata) const
 {
     const auto [metadata_version, metadata_file_path, compression_method] = getLatestOrExplicitMetadataFileAndVersion(
         object_storage,
@@ -193,7 +197,8 @@ std::pair<IcebergDataSnapshotPtr, TableStateSnapshot> IcebergMetadata::getReleva
         persistent_components.metadata_cache,
         context,
         log.get(),
-        persistent_components.table_uuid);
+        persistent_components.table_uuid,
+        force_fetch_latest_metadata);
     return getState(context, metadata_file_path, metadata_version);
 }
 
@@ -208,6 +213,67 @@ IcebergMetadata::IcebergMetadata(
     , data_lake_settings(configuration_->getDataLakeSettings())
     , write_format(configuration_->format)
 {
+
+    /// TODO: for now it's okay to start/stop the task via constructor/destructor. Once refactored, we'd need to plumb startup/shutdown and schedule the task from there
+    if (cache_ptr && data_lake_settings[DataLakeStorageSetting::iceberg_metadata_async_refresh_period_ms] != 0)
+    {
+        background_metadata_refresher_task = context_->getIcebergSchedulePool().createTask(
+            StorageID("", persistent_components.table_uuid ? *persistent_components.table_uuid : persistent_components.table_path),
+            "backgroundMetadataRefresherThread",
+            [this]
+            {
+                this->backgroundMetadataRefresherThread();
+            }
+        );
+        background_metadata_refresher_task->activateAndSchedule();
+    }
+}
+
+IcebergMetadata::~IcebergMetadata()
+{
+    if (background_metadata_refresher_task)
+        background_metadata_refresher_task->deactivate();
+}
+
+void IcebergMetadata::backgroundMetadataRefresherThread()
+{
+    size_t refresh_period = data_lake_settings[DataLakeStorageSetting::iceberg_metadata_async_refresh_period_ms];
+    SCOPE_EXIT({
+        background_metadata_refresher_task->scheduleAfter(refresh_period);
+    });
+
+    try
+    {
+        /// TODO: also we'd want to run all these download operations as separate scheduled tasks - to parallelize it and
+        ///       to prevent running a heavy multi-step operation as: IO > deserialization > parsing > IO > deserialization > parsing > ...
+        ///       We'll be able to achieve that after getting asyncIterator refactoring
+
+        /// first, we fetch the latest metadata version and cache it;
+        /// as a part of the same method, we download metadata.json of the latest metadata version
+        /// and after parsing it, we fetch manifest lists, parse and cache them
+        auto ctx = Context::getGlobalContextInstance()->getBackgroundContext();
+        auto [actual_data_snapshot, actual_table_state_snapshot] = getRelevantState(ctx, true);
+        if (actual_data_snapshot)
+        {
+            for (const auto & entry : actual_data_snapshot->manifest_list_entries)
+            {
+                /// second, we fetch, parse and cache each manifest file
+                auto manifest_file_ptr = getManifestFileEntriesHandle(
+                    object_storage, persistent_components, ctx, log, entry, actual_table_state_snapshot.schema_id);
+            }
+        }
+
+        LOG_TRACE(log, "backgroundMetadataRefresherThread: refresh_period={} table_path={}/{} latest_metadata={}/{}",
+                 refresh_period,
+                 persistent_components.table_path,
+                 persistent_components.table_uuid ? *(persistent_components.table_uuid) : "no_uuid",
+                 actual_table_state_snapshot.metadata_version,
+                 actual_table_state_snapshot.metadata_file_path);
+    }
+    catch (...)
+    {
+        DB::tryLogCurrentException(log);
+    }
 }
 
 Int32 IcebergMetadata::parseTableSchema(
