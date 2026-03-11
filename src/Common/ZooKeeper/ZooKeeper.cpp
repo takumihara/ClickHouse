@@ -1,3 +1,4 @@
+#include <Common/ZooKeeper/ZooKeeperWatchesTracker.h>
 #include <Common/OpenTelemetryTracingContext.h>
 #include <Common/OpenTelemetryTraceContext.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
@@ -262,7 +263,10 @@ ZooKeeper::~ZooKeeper()
         (*reconnect_task)->deactivate();
 }
 
-ZooKeeper::ZooKeeper(ZooKeeperArgs args_, std::shared_ptr<DB::ZooKeeperLog> zk_log_, std::shared_ptr<DB::AggregatedZooKeeperLog> aggregated_zookeeper_log_)
+ZooKeeper::ZooKeeper(
+    ZooKeeperArgs args_,
+    std::shared_ptr<DB::ZooKeeperLog> zk_log_,
+    std::shared_ptr<DB::AggregatedZooKeeperLog> aggregated_zookeeper_log_)
     : opentelemetry_start_keeper_trace_probability(calculateOpenTelemetryProbability())
     , zk_log(std::move(zk_log_))
     , aggregated_zookeeper_log(std::move(aggregated_zookeeper_log_))
@@ -278,7 +282,12 @@ ZooKeeper::ZooKeeper(std::unique_ptr<Coordination::IKeeper> existing_impl)
 }
 
 
-ZooKeeper::ZooKeeper(const ZooKeeperArgs & args_, std::shared_ptr<DB::ZooKeeperLog> zk_log_, std::shared_ptr<DB::AggregatedZooKeeperLog> aggregated_zookeeper_log_, Strings availability_zones_, std::unique_ptr<Coordination::IKeeper> existing_impl)
+ZooKeeper::ZooKeeper(
+    const ZooKeeperArgs & args_,
+    std::shared_ptr<DB::ZooKeeperLog> zk_log_,
+    std::shared_ptr<DB::AggregatedZooKeeperLog> aggregated_zookeeper_log_,
+    Strings availability_zones_,
+    std::unique_ptr<Coordination::IKeeper> existing_impl)
     : availability_zones(std::move(availability_zones_))
     , opentelemetry_start_keeper_trace_probability(calculateOpenTelemetryProbability())
     , zk_log(std::move(zk_log_))
@@ -1442,6 +1451,13 @@ bool ZooKeeper::isFeatureEnabled(DB::KeeperFeatureFlag feature_flag) const
 Int64 ZooKeeper::getClientID() const
 {
     return impl->getSessionID();
+}
+
+std::shared_ptr<Coordination::ZooKeeperWatchesTracker> ZooKeeper::getWatchesTracker() const
+{
+    if (auto * zk_impl = dynamic_cast<Coordination::ZooKeeper *>(impl.get()))
+        return zk_impl->getWatchesTracker();
+    return nullptr;
 }
 
 Coordination::WatchCallbackPtrOrEventPtr ZooKeeper::createWatchFromRawCallback(const String & id, const Coordination::IKeeper::WatchCallbackCreator & creator)

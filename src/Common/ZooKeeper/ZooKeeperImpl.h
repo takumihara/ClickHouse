@@ -132,6 +132,8 @@ public:
     /// Useful to check owner of ephemeral node.
     int64_t getSessionID() const override { return session_id; }
 
+    std::shared_ptr<ZooKeeperWatchesTracker> getWatchesTracker() const { return watches_tracker; }
+
     void executeGenericRequest(
         const ZooKeeperRequestPtr & request,
         ResponseCallback callback,
@@ -367,6 +369,7 @@ private:
     CurrentMetrics::Increment active_session_metric_increment{CurrentMetrics::ZooKeeperSession};
     std::shared_ptr<ZooKeeperLog> zk_log;
     std::shared_ptr<AggregatedZooKeeperLog> aggregated_zookeeper_log;
+    std::shared_ptr<ZooKeeperWatchesTracker> watches_tracker;
 
     std::atomic<int64_t> last_zxid_seen;
 

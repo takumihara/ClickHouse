@@ -468,6 +468,9 @@ ZooKeeper::ZooKeeper(
             throw;
     }
 
+    if (args.enable_watches_tracking)
+        watches_tracker = std::make_shared<ZooKeeperWatchesTracker>();
+
     if (!args.auth_scheme.empty())
         sendAuth(args.auth_scheme, args.identity);
 
@@ -836,11 +839,16 @@ void ZooKeeper::sendThread()
                             };
                         });
 
-                    if (info.watch)
-                        info.request->has_watch = true;
-
                     if (info.request->add_root_path)
                         info.request->addRootPath(args.chroot);
+
+                    if (info.watch)
+                    {
+                        info.request->has_watch = true;
+
+                        if (watches_tracker)
+                            watches_tracker->requested(info.request, info.watch);
+                    }
 
                     /// Insert into operations AFTER mutating the request (has_watch, addRootPath)
                     /// to avoid a data race: receiveThread reads from operations concurrently,
@@ -1031,7 +1039,12 @@ void ZooKeeper::receiveEvent()
                 for (const auto & event_or_callback : it->second)
                 {
                     if (event_or_callback)
+                    {
                         event_or_callback(watch_response);
+
+                        if (watches_tracker)
+                            watches_tracker->fired(event_or_callback);
+                    }
                 }
 
                 CurrentMetrics::sub(CurrentMetrics::ZooKeeperWatch, it->second.size());
@@ -1096,9 +1109,16 @@ void ZooKeeper::receiveEvent()
             else
                 add_watch = resp->error == Error::ZOK;
 
+            if (watches_tracker)
+            {
+                if (add_watch)
+                    watches_tracker->activated(watch);
+                else
+                    watches_tracker->deactivated(watch);
+            }
+
             if (add_watch)
             {
-
                 /// The key of watches should exclude the args.chroot
                 String req_path = req->getPath();
                 removeRootPath(req_path, args.chroot);
@@ -1335,6 +1355,9 @@ void ZooKeeper::finalize(bool error_send, bool error_receive, const String & rea
                         try
                         {
                             event_or_callback(response);
+
+                            if (watches_tracker)
+                                watches_tracker->fired(event_or_callback);
                         }
                         catch (...)
                         {
@@ -1383,6 +1406,9 @@ void ZooKeeper::finalize(bool error_send, bool error_receive, const String & rea
                 {
                     const WatchCallbackPtrOrEventPtr & event_or_callback = info.watch;
                     event_or_callback(response);
+
+                    if (watches_tracker)
+                        watches_tracker->fired(event_or_callback);
                 }
                 catch (...)
                 {

@@ -4853,7 +4853,8 @@ zkutil::ZooKeeperPtr Context::getZooKeeper() const
 
         try
         {
-            shared->zookeeper = zkutil::ZooKeeper::create(std::move(args), getZooKeeperLog(), getAggregatedZooKeeperLog());
+            shared->zookeeper = zkutil::ZooKeeper::create(
+                std::move(args), getZooKeeperLog(), getAggregatedZooKeeperLog());
             CurrentMetrics::set(CurrentMetrics::ZooKeeperConnectionLossStartedTimestampSeconds, 0);
         }
         catch (const Coordination::Exception & e)
@@ -5136,7 +5137,8 @@ zkutil::ZooKeeperPtr Context::getAuxiliaryZooKeeper(const String & name) const
         args.enforce_component_tracking = getServerSettings()[ServerSetting::enforce_keeper_component_tracking];
 
         zookeeper = shared->auxiliary_zookeepers.emplace(name,
-                        zkutil::ZooKeeper::create(std::move(args), getZooKeeperLog(), getAggregatedZooKeeperLog())).first;
+                        zkutil::ZooKeeper::create(
+                            std::move(args), getZooKeeperLog(), getAggregatedZooKeeperLog())).first;
 
         if (auto zookeeper_connection_log = getZooKeeperConnectionLog(); zookeeper_connection_log)
             zookeeper_connection_log->addConnected(name, *zookeeper->second, ZooKeeperConnectionLog::keeper_init_reason);
@@ -5194,7 +5196,8 @@ static void reloadZooKeeperIfChangedImpl(
         zkutil::ZooKeeperArgs args(*config, config_name);
         args.send_receive_os_threads_nice_value = send_receive_os_threads_nice_value;
         args.enforce_component_tracking = enforce_component_tracking;
-        zk = zkutil::ZooKeeper::create(std::move(args), std::move(zk_log), std::move(aggregated_zookeeper_log));
+        zk = zkutil::ZooKeeper::create(
+            std::move(args), std::move(zk_log), std::move(aggregated_zookeeper_log));
 
         if (zk_concection_log)
         {
