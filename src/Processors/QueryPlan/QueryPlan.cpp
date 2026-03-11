@@ -576,9 +576,15 @@ void QueryPlan::optimize(const QueryPlanOptimizationSettings & optimization_sett
     if (optimization_settings.remove_redundant_sorting)
         QueryPlanOptimizations::tryRemoveRedundantSorting(root);
 
-    QueryPlanOptimizations::optimizeTreeFirstPass(optimization_settings, *root, nodes);
-    QueryPlanOptimizations::optimizeTreeSecondPass(optimization_settings, *root, nodes, *this);
-    if (optimization_settings.build_sets)
+    int optimize_run_passes = optimization_settings.optimize_run_passes >= 0 ? optimization_settings.optimize_run_passes : std::numeric_limits<int>::max();
+
+    if (optimize_run_passes >= 1)
+        QueryPlanOptimizations::optimizeTreeFirstPass(optimization_settings, *root, nodes);
+
+    if (optimize_run_passes >= 2)
+        QueryPlanOptimizations::optimizeTreeSecondPass(optimization_settings, *root, nodes, *this);
+
+    if (optimization_settings.build_sets && optimize_run_passes >= 3)
         QueryPlanOptimizations::addStepsToBuildSets(optimization_settings, *this, *root, nodes);
 }
 
