@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
+import math
 import os
+import re
 import time
 import pytest
 
@@ -174,6 +176,9 @@ def started_cluster_compat():
         cluster_compat.shutdown()
 
 
+CHUNK_SIZE = 4096  # snapshot_transfer_chunk_size used by the small-chunk clusters
+
+
 def stop_zk(zk):
     try:
         if zk:
@@ -181,6 +186,52 @@ def stop_zk(zk):
             zk.close()
     except:
         pass
+
+
+def get_new_snapshot_log_lines(node, total_log_lines_before):
+    """
+    Return log lines containing "Saving snapshot" that were written after
+    total_log_lines_before (a total log-file line count recorded before the
+    operation under test).  Using a total-line baseline instead of a pattern-
+    match count avoids any cross-test contamination: only lines physically
+    appended to the log after the baseline are examined.
+    """
+    output = node.exec_in_container(
+        [
+            "bash",
+            "-c",
+            f"tail -n +{total_log_lines_before + 1}"
+            " /var/log/clickhouse-server/clickhouse-server.log"
+            " | grep 'Saving snapshot' || true",
+        ]
+    )
+    return [line for line in output.splitlines() if line]
+
+
+def get_latest_snapshot_size(cl, node):
+    """
+    Return the size in bytes of the latest snapshot file visible to this node.
+    For local-disk clusters the file is on the container filesystem; for S3
+    clusters it is an object in the MinIO "snapshots" bucket.
+    """
+    if cl is cluster_s3:
+        objects = sorted(
+            cl.minio_client.list_objects("snapshots", recursive=True),
+            key=lambda o: o.last_modified,
+        )
+        assert objects, "No snapshot objects found in the MinIO 'snapshots' bucket"
+        return objects[-1].size
+    else:
+        result = node.exec_in_container(
+            [
+                "bash",
+                "-c",
+                "find /var/lib/clickhouse/coordination/snapshots/ -name '*.bin'"
+                " -printf '%T@ %s\\n' | sort -n | tail -1 | awk '{print $2}'",
+            ]
+        ).strip()
+        assert result, "No snapshot files found under coordination/snapshots/"
+        return int(result)
 
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
@@ -193,9 +244,10 @@ def test_recover_from_snapshot_with_chunked_transfer(chunked_transfer_nodes):
     snapshot_transfer_chunk_size=4096 the ~300 KB snapshot is split into multiple
     4 KB chunks.  We verify:
       1. Data on node_lagging matches the rest of the cluster after recovery.
-      2. The snapshot was actually transferred in more than one chunk
-         (checked via log line "Saving snapshot <idx> obj_id 2" on node_lagging,
-         where the count is anchored to lines added during this recovery).
+      2. The snapshot was transferred in exactly ceil(snapshot_size / CHUNK_SIZE)
+         chunks: we parse all "Saving snapshot … obj_id N" lines written during
+         this recovery (anchored to a total-log-line baseline) and check that the
+         set of obj_ids is exactly {0, 1, …, expected_chunks-1}.
 
     The test runs for both local-disk and S3-backed clusters (parametrized).
     """
@@ -238,10 +290,10 @@ def test_recover_from_snapshot_with_chunked_transfer(chunked_transfer_nodes):
         for zk in [leader_zk, middle_zk, lagging_zk]:
             stop_zk(zk)
 
-    # Record the log line count before recovery so the chunk-count assertion
-    # below is anchored to this recovery only and not contaminated by previous
-    # test runs on the same node.
-    log_lines_before = int(node_lagging.count_in_log("Saving snapshot").strip())
+    # Record the total log-file line count before recovery so the chunk-count
+    # assertion below is anchored to lines physically appended during this
+    # recovery and not contaminated by any previous test runs on the same node.
+    total_log_lines_before = node_lagging.count_log_lines()
 
     # node_lagging is stale: it must recover via snapshot transfer (not log replay).
     node_lagging.start_clickhouse(20)
@@ -284,17 +336,21 @@ def test_recover_from_snapshot_with_chunked_transfer(chunked_transfer_nodes):
         for zk in [leader_zk, middle_zk, lagging_zk]:
             stop_zk(zk)
 
-    # Verify that the snapshot was transferred in at least 3 chunks during this
-    # recovery.  The follower logs "Saving snapshot <idx> obj_id <n>" for every
-    # received chunk; obj_id 2 appearing means at least 3 calls were made.
-    log_lines_after = int(node_lagging.count_in_log("Saving snapshot").strip())
-    new_log = node_lagging.grep_in_log("Saving snapshot")
-    # Filter to lines produced during this recovery (crude but sufficient: we
-    # just need to confirm obj_id 2 appeared in the new entries).
-    assert log_lines_after > log_lines_before, "No snapshot transfer log lines appeared during recovery"
-    assert "obj_id 2" in new_log, (
-        "Expected snapshot to be transferred in at least 3 chunks (obj_id 2 not found in log). "
-        f"Log output:\n{new_log}"
+    # Verify the exact number of chunks transferred.  The follower logs
+    # "Saving snapshot <idx> obj_id <n>" for every received chunk; we collect
+    # all obj_ids from lines added after the baseline and assert they form the
+    # contiguous range [0, expected_chunks).
+    snapshot_lines = get_new_snapshot_log_lines(node_lagging, total_log_lines_before)
+    snapshot_size = get_latest_snapshot_size(cl, node_lagging)
+    expected_chunks = math.ceil(snapshot_size / CHUNK_SIZE)
+    obj_ids = sorted(
+        int(m.group(1))
+        for line in snapshot_lines
+        if (m := re.search(r"obj_id (\d+)", line))
+    )
+    assert obj_ids == list(range(expected_chunks)), (
+        f"Expected obj_ids 0..{expected_chunks - 1} ({expected_chunks} chunks for "
+        f"{snapshot_size}-byte snapshot / {CHUNK_SIZE}-byte chunks), got: {obj_ids}"
     )
 
 
@@ -304,10 +360,11 @@ def test_recover_after_interrupted_transfer(chunked_transfer_nodes):
     the next recovery from succeeding.
 
     node_lagging is stopped while the leader accumulates enough data to trigger a
-    snapshot.  node_lagging is then started and killed as soon as it begins
-    receiving snapshot chunks.  The leader's save_logical_snp_obj with
-    is_first_obj=true must overwrite any leftover temp file and the second full
-    recovery must produce correct data.
+    snapshot.  node_lagging is then started and killed while it is provably
+    mid-transfer: the `keeper_save_snapshot_pause_mid_transfer` PAUSEABLE_ONCE failpoint causes
+    save_logical_snp_obj to block after writing a non-last chunk; SYSTEM WAIT
+    FAILPOINT confirms the pause before we kill the process.  The second full
+    recovery (failpoint disabled on restart) must produce correct data.
 
     The test runs for both local-disk and S3-backed clusters (parametrized).
     """
@@ -333,18 +390,15 @@ def test_recover_after_interrupted_transfer(chunked_transfer_nodes):
     finally:
         stop_zk(leader_zk)
 
-    # Count "Saving snapshot" entries already in the log so we can detect new ones.
-    # (The log file accumulates across restarts unless rotated.)
-    snapshot_count_before = int(node_lagging.count_in_log("Saving snapshot").strip())
-
-    # First start: kill node_lagging as soon as it begins receiving snapshot chunks.
+    # First start: pause node_lagging mid-transfer via failpoint, then kill it.
+    # Enabling the failpoint right after startup is safe: NuRaft needs several
+    # seconds to connect, detect staleness, and receive the first snapshot chunk —
+    # well after the single ENABLE query completes.
     node_lagging.start_clickhouse(20)
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        current_count = int(node_lagging.count_in_log("Saving snapshot").strip())
-        if current_count > snapshot_count_before:
-            break
-        time.sleep(0.5)
+    node_lagging.query("SYSTEM ENABLE FAILPOINT keeper_save_snapshot_pause_mid_transfer")
+    # Block until a NuRaft thread is suspended inside save_logical_snp_obj,
+    # guaranteeing node_lagging is killed while the transfer is in progress.
+    node_lagging.query("SYSTEM WAIT FAILPOINT keeper_save_snapshot_pause_mid_transfer PAUSE")
     node_lagging.stop_clickhouse(kill=True)
 
     # Second start: let node_lagging recover fully from whatever partial state
@@ -399,9 +453,9 @@ def test_recover_with_chunk_size_larger_than_snapshot(started_cluster_large_chun
 
     node6.stop_clickhouse(kill=True)
 
-    # Baseline before recovery so the log assertion below is not contaminated
-    # by any previous snapshot lines in node6's log file.
-    log_lines_before = int(node6.count_in_log("Saving snapshot").strip())
+    # Total-line baseline before recovery so the assertion below sees only lines
+    # appended during this run and is not contaminated by previous tests.
+    total_log_lines_before = node6.count_log_lines()
 
     try:
         node4_zk = keeper_utils.get_fake_zk(cluster_large_chunk, "node4")
@@ -448,13 +502,16 @@ def test_recover_with_chunk_size_larger_than_snapshot(started_cluster_large_chun
     # With a 100 MB chunk size the snapshot fits in a single object, so the
     # leader calls read_logical_snp_obj exactly once (obj_id=0, is_last=true),
     # and the follower's save_logical_snp_obj takes the is_first&&is_last branch.
-    log_lines_after = int(node6.count_in_log("Saving snapshot").strip())
-    assert log_lines_after > log_lines_before, "No snapshot transfer log lines appeared during recovery"
-    new_log = node6.grep_in_log("Saving snapshot")
-    assert "obj_id 0" in new_log, f"Expected obj_id 0 in log:\n{new_log}"
-    assert "obj_id 1" not in new_log, (
-        "Expected snapshot to be transferred as a single chunk (obj_id 1 must not appear). "
-        f"Log output:\n{new_log}"
+    snapshot_lines = get_new_snapshot_log_lines(node6, total_log_lines_before)
+    assert snapshot_lines, "No 'Saving snapshot' log lines appeared during recovery"
+    obj_ids = sorted(
+        int(m.group(1))
+        for line in snapshot_lines
+        if (m := re.search(r"obj_id (\d+)", line))
+    )
+    assert obj_ids == [0], (
+        "Expected snapshot to be transferred as a single chunk (obj_id list must be [0]). "
+        f"Got: {obj_ids}"
     )
 
 
@@ -478,7 +535,7 @@ def test_recover_from_snapshot_sent_by_old_leader(started_cluster_compat):
 
     compat3.stop_clickhouse(kill=True)
 
-    log_lines_before = int(compat3.count_in_log("Saving snapshot").strip())
+    total_log_lines_before = compat3.count_log_lines()
 
     try:
         leader_zk = keeper_utils.get_fake_zk(cluster_compat, "compat1")
@@ -525,11 +582,14 @@ def test_recover_from_snapshot_sent_by_old_leader(started_cluster_compat):
     # The old leader has no chunking: it always sends is_first_obj=is_last_obj=true,
     # so the new follower must have taken the is_first&&is_last branch.
     # Confirm exactly one obj_id (0) was logged during this recovery.
-    log_lines_after = int(compat3.count_in_log("Saving snapshot").strip())
-    assert log_lines_after > log_lines_before, "No snapshot transfer log lines appeared during recovery"
-    new_log = compat3.grep_in_log("Saving snapshot")
-    assert "obj_id 0" in new_log, f"Expected obj_id 0 in compat3 log:\n{new_log}"
-    assert "obj_id 1" not in new_log, (
-        "Old leader must send a single-chunk snapshot; obj_id 1 must not appear. "
-        f"Log output:\n{new_log}"
+    snapshot_lines = get_new_snapshot_log_lines(compat3, total_log_lines_before)
+    assert snapshot_lines, "No 'Saving snapshot' log lines appeared during compat3 recovery"
+    obj_ids = sorted(
+        int(m.group(1))
+        for line in snapshot_lines
+        if (m := re.search(r"obj_id (\d+)", line))
+    )
+    assert obj_ids == [0], (
+        "Old leader must send a single-chunk snapshot; obj_id list must be [0]. "
+        f"Got: {obj_ids}"
     )

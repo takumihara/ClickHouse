@@ -26,6 +26,7 @@
 #include <Common/ZooKeeper/ZooKeeperCommon.h>
 #include <Common/ZooKeeper/ZooKeeperConstants.h>
 #include <Common/ZooKeeper/ZooKeeperIO.h>
+#include <Common/FailPoint.h>
 #include <Common/logger_useful.h>
 #include <Interpreters/Context.h>
 
@@ -51,6 +52,11 @@ namespace CurrentMetrics
 
 namespace DB
 {
+
+namespace FailPoints
+{
+    extern const char keeper_save_snapshot_pause_mid_transfer[];
+}
 
 namespace CoordinationSetting
 {
@@ -980,6 +986,10 @@ void KeeperStateMachine<Storage>::save_logical_snp_obj(
             /// Append this chunk to the accumulation buffer (file or memory depending on disk type).
             ReadBufferFromNuraftBuffer reader(data);
             copyData(reader, *snapshot_receive_ctx->write_buf);
+
+            /// Allow integration tests to reliably interrupt a transfer mid-stream.
+            if (!is_last_obj)
+                FailPointInjection::pauseFailPoint(FailPoints::keeper_save_snapshot_pause_mid_transfer);
 
             if (is_last_obj)
             {
