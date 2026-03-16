@@ -125,11 +125,16 @@ private:
 
     void visit(ASTSelectQuery & select, ASTPtr &) const
     {
-        if (select.recursive_with)
+        if (select.with())
             for (const auto & child : select.with()->children)
             {
                 if (typeid_cast<ASTWithElement *>(child.get()))
                     with_aliases.insert(child->as<ASTWithElement>()->name);
+                /// Also collect expression aliases (e.g. WITH expr AS alias) so that
+                /// they are not mistakenly treated as table identifiers in IN().
+                /// See https://github.com/ClickHouse/ClickHouse/issues/99308
+                else if (auto alias = child->tryGetAlias(); !alias.empty())
+                    with_aliases.insert(alias);
             }
 
         if (select.tables())
@@ -226,10 +231,16 @@ private:
                     }
                     else if (is_operator_in && i == 1)
                     {
-                        /// XXX: for some unknown reason this place assumes that argument can't be an alias,
-                        ///      like in the similar code in `MarkTableIdentifierVisitor`.
                         if (auto * identifier = child->children[i]->as<ASTIdentifier>())
                         {
+                            /// Skip if identifier matches a WITH expression alias.
+                            /// Otherwise it would be incorrectly converted to a table identifier
+                            /// and qualified with the default database name.
+                            if (with_aliases.contains(identifier->name()))
+                            {
+                                visit(child->children[i]);
+                                continue;
+                            }
                             /// If identifier is broken then we can do nothing and get an exception
                             auto maybe_table_identifier = identifier->createTable();
                             if (maybe_table_identifier)
