@@ -1,7 +1,14 @@
 #include <Processors/Transforms/DistinctTransform.h>
 
 #include <Columns/ColumnsNumber.h>
+#include <Common/ProfileEvents.h>
 #include <Common/assert_cast.h>
+
+namespace ProfileEvents
+{
+    extern const Event DistinctStateRows;
+    extern const Event DistinctStateBytes;
+}
 
 namespace DB
 {
@@ -32,6 +39,12 @@ void LCOptimizationController::update(size_t num_rows, size_t new_indices_in_chu
         else
             state = State::Enabled;
     }
+}
+
+DistinctTransform::~DistinctTransform()
+{
+    ProfileEvents::increment(ProfileEvents::DistinctStateRows, data.getTotalRowCount());
+    ProfileEvents::increment(ProfileEvents::DistinctStateBytes, data.getTotalByteCount());
 }
 
 DistinctTransform::DistinctTransform(

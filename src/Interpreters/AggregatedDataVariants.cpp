@@ -109,6 +109,23 @@ size_t AggregatedDataVariants::sizeWithoutOverflowRow() const
     }
 }
 
+size_t AggregatedDataVariants::bytesAllocated() const
+{
+    switch (type)
+    {
+        case Type::EMPTY:
+            return 0;
+        case Type::without_key:
+            return 0;
+
+    #define M(NAME, IS_TWO_LEVEL) \
+        case Type::NAME: \
+            return (NAME)->data.getBufferSizeInBytes();
+        APPLY_FOR_AGGREGATED_VARIANTS(M)
+    #undef M
+    }
+}
+
 const char * AggregatedDataVariants::getMethodName() const
 {
     switch (type)

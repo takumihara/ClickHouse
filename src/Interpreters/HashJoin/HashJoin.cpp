@@ -41,6 +41,14 @@
 #include <Interpreters/HashJoin/HashJoinMethods.h>
 #include <Interpreters/HashJoin/JoinUsedFlags.h>
 
+#include <Common/ProfileEvents.h>
+
+namespace ProfileEvents
+{
+    extern const Event JoinStateRows;
+    extern const Event JoinStateBytes;
+}
+
 namespace DB
 {
 
@@ -1353,12 +1361,16 @@ HashJoin::~HashJoin()
         LOG_TEST(log, "{}Join data has been already released", instance_log_id);
         return;
     }
+    size_t total_rows = getTotalRowCount();
+    size_t total_bytes = getTotalByteCount();
+    ProfileEvents::increment(ProfileEvents::JoinStateRows, total_rows);
+    ProfileEvents::increment(ProfileEvents::JoinStateBytes, total_bytes);
     LOG_TEST(
         log,
         "{}Join data is being destroyed, {} bytes and {} rows in hash table",
         instance_log_id,
-        getTotalByteCount(),
-        getTotalRowCount());
+        total_bytes,
+        total_rows);
 }
 
 bool HashJoin::hasNonJoinedRows()

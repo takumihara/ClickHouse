@@ -29,6 +29,8 @@ namespace CurrentMetrics
 namespace ProfileEvents
 {
     extern const Event ExternalAggregationMerge;
+    extern const Event AggregatorStateRows;
+    extern const Event AggregatorStateBytes;
 }
 
 namespace DB
@@ -982,6 +984,14 @@ void AggregatingTransform::initGenerate()
 {
     if (is_generate_initialized.test_and_set())
         return;
+
+    {
+        ProfileEvents::increment(ProfileEvents::AggregatorStateRows, variants.size());
+        size_t total_state_bytes = variants.bytesAllocated();
+        for (const auto & pool : variants.aggregates_pools)
+            total_state_bytes += pool->usedBytes();
+        ProfileEvents::increment(ProfileEvents::AggregatorStateBytes, total_state_bytes);
+    }
 
     /// If there was no data, and we aggregate without keys, and we must return single row with the result of empty aggregation.
     /// To do this, we pass a block with zero rows to aggregate.

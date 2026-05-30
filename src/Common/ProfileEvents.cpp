@@ -895,6 +895,17 @@ The server successfully detected this situation and will download merged part fr
     \
     M(AggregationPreallocatedElementsInHashTables, "How many elements were preallocated in hash tables for aggregation.", ValueType::Number) \
     M(AggregationHashTablesInitializedAsTwoLevel, "How many hash tables were inited as two-level for aggregation.", ValueType::Number) \
+    M(AggregationConvertedToTwoLevel, "How many times a single-level hash table was dynamically converted to two-level during GROUP BY execution.", ValueType::Number) \
+    M(AggregatorStateRows, "Number of rows (unique group keys) in the GROUP BY aggregation state at the end of execution. Summed across threads of a query.", ValueType::Number) \
+    M(AggregatorStateBytes, "Bytes used by the GROUP BY aggregation state (Arena allocations) at the end of execution. Summed across threads of a query.", ValueType::Bytes) \
+    M(DistinctStateRows, "Number of unique rows kept in DISTINCT state at the end of execution. Summed across DISTINCT transforms of a query.", ValueType::Number) \
+    M(DistinctStateBytes, "Bytes used by DISTINCT state at the end of execution. Summed across DISTINCT transforms of a query.", ValueType::Bytes) \
+    M(OrderByStateRows, "Maximum number of rows held in the ORDER BY in-memory sort state during execution. Summed across sorting transforms of a query.", ValueType::Number) \
+    M(OrderByStateBytes, "Maximum bytes held in the ORDER BY in-memory sort state during execution. Summed across sorting transforms of a query.", ValueType::Bytes) \
+    M(SetStateRows, "Number of unique rows materialized in IN-clause Sets at the end of build. Summed across Sets of a query.", ValueType::Number) \
+    M(SetStateBytes, "Bytes used by IN-clause Sets at the end of build. Summed across Sets of a query.", ValueType::Bytes) \
+    M(JoinStateRows, "Number of rows in JOIN hash table build side. Summed across JOIN operators of a query.", ValueType::Number) \
+    M(JoinStateBytes, "Bytes used by JOIN hash table build side. Summed across JOIN operators of a query.", ValueType::Bytes) \
     M(AggregationOptimizedEqualRangesOfKeys, "For how many blocks optimization of equal ranges of keys was applied", ValueType::Number) \
     M(HashJoinPreallocatedElementsInHashTables, "How many elements were preallocated in hash tables for hash join.", ValueType::Number) \
     \

@@ -19,6 +19,8 @@
 namespace ProfileEvents
 {
     extern const Event ExternalSortMerge;
+    extern const Event OrderByStateRows;
+    extern const Event OrderByStateBytes;
 }
 
 
@@ -122,6 +124,12 @@ private:
     LoggerPtr log;
 };
 
+MergeSortingTransform::~MergeSortingTransform()
+{
+    ProfileEvents::increment(ProfileEvents::OrderByStateRows, peak_rows_in_state);
+    ProfileEvents::increment(ProfileEvents::OrderByStateBytes, peak_bytes_in_state);
+}
+
 MergeSortingTransform::MergeSortingTransform(
     SharedHeader header,
     const SortDescription & description_,
@@ -199,6 +207,10 @@ void MergeSortingTransform::consume(Chunk chunk)
 
     sum_rows_in_blocks += chunk.getNumRows();
     sum_bytes_in_blocks += chunk.allocatedBytes();
+    if (sum_rows_in_blocks > peak_rows_in_state)
+        peak_rows_in_state = sum_rows_in_blocks;
+    if (sum_bytes_in_blocks > peak_bytes_in_state)
+        peak_bytes_in_state = sum_bytes_in_blocks;
     chunks.push_back(std::move(chunk));
 
     /** If significant amount of data was accumulated, perform preliminary merging step.

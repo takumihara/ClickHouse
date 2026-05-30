@@ -313,6 +313,8 @@ struct AggregatedDataVariants : private boost::noncopyable
     /// Number of rows (different keys).
     size_t size() const;
     size_t sizeWithoutOverflowRow() const;
+    /// Total size of hash table buffers, excluding aggregate function states stored in Arenas.
+    size_t bytesAllocated() const;
     const char * getMethodName() const;
     bool isTwoLevel() const;
     bool isConvertibleToTwoLevel() const;

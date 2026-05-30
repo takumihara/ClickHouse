@@ -63,6 +63,8 @@ public:
 
     String getName() const override { return "DistinctTransform"; }
 
+    ~DistinctTransform() override;
+
 protected:
     void transform(Chunk & chunk) override;
 

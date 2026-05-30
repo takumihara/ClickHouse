@@ -34,6 +34,14 @@
 #include <base/sort.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 
+#include <Common/ProfileEvents.h>
+
+namespace ProfileEvents
+{
+    extern const Event SetStateRows;
+    extern const Event SetStateBytes;
+}
+
 
 namespace DB
 {
@@ -548,6 +556,15 @@ bool Set::empty() const
 {
     std::shared_lock lock(rwlock);
     return data.empty();
+}
+
+Set::~Set()
+{
+    if (is_created.load(std::memory_order_relaxed))
+    {
+        ProfileEvents::increment(ProfileEvents::SetStateRows, data.getTotalRowCount());
+        ProfileEvents::increment(ProfileEvents::SetStateBytes, data.getTotalByteCount());
+    }
 }
 
 size_t Set::getTotalRowCount() const

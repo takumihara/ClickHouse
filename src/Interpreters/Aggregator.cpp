@@ -51,6 +51,7 @@ namespace ProfileEvents
     extern const Event ExternalAggregationUncompressedBytes;
     extern const Event ExternalAggregationWritePart;
     extern const Event AggregationHashTablesInitializedAsTwoLevel;
+    extern const Event AggregationConvertedToTwoLevel;
     extern const Event OverflowThrow;
     extern const Event OverflowBreak;
     extern const Event OverflowAny;
@@ -1689,7 +1690,10 @@ bool Aggregator::executeOnBlock(Columns columns,
       * It allows you to make, in the subsequent, an effective merge - either economical from memory or parallel.
       */
     if (result.isConvertibleToTwoLevel() && worth_convert_to_two_level)
+    {
         result.convertToTwoLevel();
+        ProfileEvents::increment(ProfileEvents::AggregationConvertedToTwoLevel);
+    }
 
     /// Checking the constraints.
     if (!checkLimits(result_size, no_more_keys))
@@ -3551,7 +3555,10 @@ bool Aggregator::mergeOnBlock(Columns columns, size_t rows, bool is_overflows, A
       * It allows you to make, in the subsequent, an effective merge - either economical from memory or parallel.
       */
     if (result.isConvertibleToTwoLevel() && worth_convert_to_two_level)
+    {
         result.convertToTwoLevel();
+        ProfileEvents::increment(ProfileEvents::AggregationConvertedToTwoLevel);
+    }
 
     /// Checking the constraints.
     if (!checkLimits(result_size, no_more_keys))

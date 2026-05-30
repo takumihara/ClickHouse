@@ -36,6 +36,7 @@ public:
         TopKThresholdTrackerPtr threshold_tracker_ = nullptr);
 
     String getName() const override { return "MergeSortingTransform"; }
+    ~MergeSortingTransform() override;
 
 protected:
     void consume(Chunk chunk) override;
@@ -56,6 +57,9 @@ private:
 
     size_t sum_rows_in_blocks = 0;
     size_t sum_bytes_in_blocks = 0;
+    /// Peak in-memory state seen over the lifetime of this transform (before remerge / spill resets).
+    size_t peak_rows_in_state = 0;
+    size_t peak_bytes_in_state = 0;
 
     LoggerPtr log = getLogger("MergeSortingTransform");
 
