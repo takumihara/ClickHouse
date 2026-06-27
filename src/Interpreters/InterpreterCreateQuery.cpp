@@ -1349,21 +1349,33 @@ void InterpreterCreateQuery::setEngine(ASTCreateQuery & create) const
     if (create.storage)
     {
         /// This table already has a storage definition.
-        if (!create.storage->engine)
+        if (create.storage->engine)
         {
-            /// Some part of storage definition (such as PARTITION BY) is specified, but ENGINE is not: just set default one.
-            setDefaultTableEngine(*create.storage, getContext()->getSettingsRef()[Setting::default_table_engine].value);
-        }
-        /// For external tables with restore_replace_external_engine_to_null setting we replace external engines to
-        /// Null table engine.
-        else if (getContext()->getSettingsRef()[Setting::restore_replace_external_engines_to_null])
-        {
-            if (StorageFactory::instance().getStorageFeatures(create.storage->engine->name).source_access_type)
+            /// ENGINE is explicitly specified.
+            /// For external tables with restore_replace_external_engine_to_null setting we replace external engines to
+            /// Null table engine.
+            if (getContext()->getSettingsRef()[Setting::restore_replace_external_engines_to_null])
             {
-                setNullTableEngine(*create.storage);
+                if (StorageFactory::instance().getStorageFeatures(create.storage->engine->name).source_access_type)
+                {
+                    setNullTableEngine(*create.storage);
+                }
             }
+            return;
         }
-        return;
+
+        /// Only some storage clauses (such as PARTITION BY, TTL or SETTINGS) are specified, but ENGINE is not.
+        /// For `CREATE TABLE t AS source_table <clauses>` the engine must be inherited from `source_table`
+        /// instead of falling back to `default_table_engine`, otherwise the engine silently changes to MergeTree
+        /// even though the user did not ask to change it (issue #86000). This is handled by the `AS` branch below,
+        /// which re-applies the user-provided clauses on top of the inherited storage definition.
+        if (create.as_table.empty())
+        {
+            /// Not a `CREATE ... AS`: keep the historical behavior and use `default_table_engine`.
+            setDefaultTableEngine(*create.storage, getContext()->getSettingsRef()[Setting::default_table_engine].value);
+            return;
+        }
+        /// Otherwise fall through to the `AS` engine-inheritance code below.
     }
 
     /// We'll try to extract a storage definition from clause `AS`:
@@ -1427,11 +1439,56 @@ void InterpreterCreateQuery::setEngine(ASTCreateQuery & create) const
         setDefaultTableEngine(*storage_def, getContext()->getSettingsRef()[Setting::default_table_engine].value);
     }
 
+    /// If the user specified storage clauses without an engine on a `CREATE TABLE ... AS source_table`
+    /// (for example `AS source SETTINGS ...` or `AS source TTL ...`), `storage_def` holds the storage
+    /// definition inherited from `source_table`. Re-apply the user-provided clauses on top of it, so the
+    /// engine is inherited while the user's overrides are preserved (issue #86000).
+    if (create.storage && !create.is_materialized_view)
+    {
+        auto merged_ast = storage_def->clone();
+        auto & merged = merged_ast->as<ASTStorage &>();
+        const auto & user_storage = *create.storage;
+
+        if (user_storage.partition_by)
+            merged.setOrReplace(merged.partition_by, user_storage.partition_by->clone());
+        if (user_storage.primary_key)
+            merged.setOrReplace(merged.primary_key, user_storage.primary_key->clone());
+        if (user_storage.order_by)
+            merged.setOrReplace(merged.order_by, user_storage.order_by->clone());
+        if (user_storage.sample_by)
+            merged.setOrReplace(merged.sample_by, user_storage.sample_by->clone());
+        if (user_storage.ttl_table)
+            merged.setOrReplace(merged.ttl_table, user_storage.ttl_table->clone());
+        if (user_storage.unique_key)
+            merged.setOrReplace(merged.unique_key, user_storage.unique_key->clone());
+
+        if (user_storage.settings)
+        {
+            if (merged.settings)
+            {
+                /// Keep the user-provided settings first (and let them override the inherited
+                /// ones), then append the inherited engine settings the user did not specify.
+                /// This preserves the historical ordering of `CREATE TABLE dst AS src SETTINGS ...`
+                /// (see issue #21389).
+                auto combined = user_storage.settings->changes;
+                for (const auto & change : merged.settings->changes)
+                    combined.insertSetting(change.name, change.value);
+                merged.settings->changes = std::move(combined);
+            }
+            else
+            {
+                merged.setOrReplace(merged.settings, user_storage.settings->clone());
+            }
+        }
+
+        storage_def = boost::static_pointer_cast<ASTStorage>(merged_ast);
+    }
+
     /// Use the found table engine to modify the create query.
     if (create.is_materialized_view)
         create.setTargetInnerEngine(ViewTarget::To, storage_def);
     else
-        create.set(create.storage, storage_def);
+        create.setOrReplace(create.storage, storage_def);
 }
 
 void InterpreterCreateQuery::assertOrSetUUID(ASTCreateQuery & create, const DatabasePtr & database) const

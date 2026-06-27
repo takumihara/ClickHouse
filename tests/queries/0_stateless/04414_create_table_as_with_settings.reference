@@ -1,0 +1,39 @@
+-- 1. plain AS inherits engine (unchanged behavior) --
+ReplacingMergeTree
+-- 2. AS + storage SETTINGS inherits engine and applies the override --
+ReplacingMergeTree
+CREATE TABLE default.dst
+(
+    `a` DateTime,
+    `k` UInt64
+)
+ENGINE = ReplacingMergeTree
+ORDER BY a
+SETTINGS index_granularity = 4096
+-- 3. AS + session SETTINGS inherits engine --
+ReplacingMergeTree
+-- 4. AS + TTL inherits engine and applies the TTL --
+ReplacingMergeTree
+CREATE TABLE default.dst
+(
+    `a` DateTime,
+    `k` UInt64
+)
+ENGINE = ReplacingMergeTree
+ORDER BY a
+TTL a + toIntervalDay(1)
+SETTINGS index_granularity = 8192
+-- 5. AS a Log table + SETTINGS inherits Log --
+Log
+-- 6. AS + explicit ENGINE still overrides the source (no regression) --
+MergeTree
+-- 7. AS + ORDER BY override keeps the inherited engine --
+ReplacingMergeTree
+CREATE TABLE default.dst
+(
+    `a` DateTime,
+    `k` UInt64
+)
+ENGINE = ReplacingMergeTree
+ORDER BY k
+SETTINGS index_granularity = 8192
